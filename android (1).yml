@@ -1,0 +1,152 @@
+# Source: either project.godot in repo root, or zip parts (Kazan_part*.zip); legacy: sort -V picks newest Kazan_Ulitsy_v*.zip
+name: Android APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: barichello/godot-ci:4.2.2
+    env:
+      HOME: /root
+      XDG_CONFIG_HOME: /root/.config
+      XDG_DATA_HOME: /root/.local/share
+      ANDROID_HOME: /usr/lib/android-sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y python3
+
+      - name: Find and extract game source
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get install -y unzip >/dev/null 2>&1 || true
+          if [ -f "project.godot" ]; then
+            PROJECT_PATH="."
+          else
+            mkdir -p unpacked
+            COUNT=0
+            for Z in Kazan_part*.zip; do
+              [ -f "$Z" ] || continue
+              unzip -q -o "$Z" -d unpacked
+              COUNT=$((COUNT+1))
+            done
+            if [ "$COUNT" -eq 0 ]; then
+              echo "ERROR: no project.godot and no Kazan_part*.zip files found."
+              ls -lah
+              exit 1
+            fi
+            PROJECT_FILE="$(find unpacked -type f -name project.godot -print -quit)"
+            if [ -z "$PROJECT_FILE" ]; then
+              echo "ERROR: project.godot not found inside the zip parts."
+              exit 1
+            fi
+            PROJECT_PATH="$(dirname "$PROJECT_FILE")"
+          fi
+          mkdir -p "$PROJECT_PATH/.github/workflows"
+          cp .github/workflows/android.yml "$PROJECT_PATH/.github/workflows/android.yml" 2>/dev/null || true
+          echo "PROJECT_DIR=$PROJECT_PATH" >> "$GITHUB_ENV"
+          echo "project_dir=$PROJECT_PATH" >> "$GITHUB_OUTPUT"
+          echo "Godot project: $PROJECT_PATH"
+
+      - name: Check Android build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "HOME=$HOME"
+          echo "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+          echo "XDG_DATA_HOME=$XDG_DATA_HOME"
+          godot --version
+          java -version
+          test -d "$ANDROID_HOME/platform-tools"
+          test -f "$XDG_DATA_HOME/godot/export_templates/4.2.2.stable/android_source.zip"
+          test -f "$XDG_DATA_HOME/godot/export_templates/4.2.2.stable/android_debug.apk"
+          echo "Android SDK, Java and matching Godot templates are present."
+
+      - name: Validate story and release data
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 tests/validate_story.py
+          python3 tests/validate_release.py
+          test -s assets/audio/dj_groove_titry.ogg
+          test -s export_presets.cfg
+          grep -q '^platform="Android"$' export_presets.cfg
+          grep -q '^export_filter="all_resources"$' export_presets.cfg
+
+      - name: Import Godot project and check scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p build
+          set +e
+          godot --headless --editor --path . --import 2>&1 | tee build/import.log
+          GODOT_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$GODOT_STATUS" -ne 0 ]; then
+            echo "ERROR: Godot resource import failed."
+            exit "$GODOT_STATUS"
+          fi
+          if grep -E 'SCRIPT ERROR:|Parse Error:' build/import.log; then
+            echo "ERROR: Godot reported GDScript errors during import."
+            exit 1
+          fi
+
+      - name: Headless runtime smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          set +e
+          godot --headless --path . --quit-after 5 2>&1 | tee build/runtime.log
+          GODOT_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$GODOT_STATUS" -ne 0 ]; then
+            echo "ERROR: Headless runtime smoke test failed."
+            exit "$GODOT_STATUS"
+          fi
+          if grep -E 'SCRIPT ERROR:|Parse Error:' build/runtime.log; then
+            echo "ERROR: Godot reported GDScript errors at runtime."
+            exit 1
+          fi
+
+      - name: Export Android debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          godot --headless --path . --export-debug "Android" build/Kazan_Ulitsy-debug.apk
+          test -s build/Kazan_Ulitsy-debug.apk
+          ls -lh build/Kazan_Ulitsy-debug.apk
+          sha256sum build/Kazan_Ulitsy-debug.apk | tee build/SHA256SUMS.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kazan-Ulitsy-Android-APK
+          path: |
+            ${{ steps.extract.outputs.project_dir }}/build/Kazan_Ulitsy-debug.apk
+            ${{ steps.extract.outputs.project_dir }}/build/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
